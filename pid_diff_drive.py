@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-
+from datetime import datetime
 import rclpy
 from rclpy.node import Node
 import math
+import csv
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
@@ -47,7 +48,8 @@ class RobotDriver(Node):
         self.y_start = 0.0
         self.start_error = 0.0
         self.error_sum = 0.0
-        self.finish = False        
+        self.finish = False  
+        self.current_pose = None      
         # Set up publisher and subscriber
         self.cmd_vel_pub = self.create_publisher(
             Twist, '/cmd_vel', 10)
@@ -60,8 +62,24 @@ class RobotDriver(Node):
         self.base_cmd.linear.y = 0.0
         self.base_cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(self.base_cmd)
+        
+        # Add path tracking
+        self.trajectory_data = []
+        self.current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.csv_filename = f'robot_trajectory_pid_{self.current_time}.csv'
+        
+        self.get_logger().info('PID for diff drive node initialized with parameters')
 
     def pid_callback(self, msg):
+        # Update position
+        self.current_pose = msg.pose.pose
+        self.current_twist_linear = msg.twist.twist.linear
+        self.current_twist_angular = msg.twist.twist.angular
+        
+        # Log position data
+        self.log_position()
+            
+        
         # Handle finish condition
         if self.finish:
             # Send a final stop command
@@ -70,8 +88,8 @@ class RobotDriver(Node):
             self.cmd_vel_pub.publish(stop_cmd)
             # Request shutdown of the node
             self.get_logger().info("Shutting down...")
-            self.destroy_node()
             return rclpy.shutdown()
+        
     
         # Get current time and calculate dt
         current_time = self.get_clock().now()
@@ -189,22 +207,64 @@ class RobotDriver(Node):
         
         # Publish command
         self.cmd_vel_pub.publish(self.base_cmd)
+    
+    def log_position(self):
+        """Log current position and calculate error from ideal path"""
+        if self.current_pose is not None:
+            current_x = self.current_pose.position.x
+            current_y = self.current_pose.position.y
+            
+            # Calculate error (distance from ideal straight line path)
+            error = self.calculate_path_error(current_x, current_y)
+            
+            data_point = {
+                'timestamp': self.get_clock().now().to_msg().sec,
+                'robot_x': current_x,
+                'robot_y': current_y,
+                'ideal_x': current_x,  # Ideal x position on straight line
+                'ideal_y': 0.0,        # Ideal y should be 0 for straight line
+                'error': error,
+                'linear_vel': self.current_twist_linear.x,
+                'angular_vel': self.current_twist_angular.z
+            }
+            self.trajectory_data.append(data_point)
+    
+    def calculate_path_error(self, current_x: float, current_y: float) -> float:
+        """Calculate error from ideal straight line path"""
+        # For straight line motion, error is simply the y-coordinate
+        return abs(current_y)
 
+    def save_trajectory_data(self):
+        """Save trajectory data to CSV file"""
+        try:
+            with open(self.csv_filename, 'w', newline='') as csvfile:
+                fieldnames = ['timestamp', 'robot_x', 'robot_y', 'ideal_x', 'ideal_y', 
+                            'error', 'linear_vel', 'angular_vel']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for data_point in self.trajectory_data:
+                    writer.writerow(data_point)
+            self.get_logger().info(f'Trajectory data saved to {self.csv_filename}')
+        except Exception as e:
+            self.get_logger().error(f'Error saving trajectory data: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
     
     # Define waypoints
     
-    pos = [[0.0, 10.0], [10, 10.0]] 
+    pos = [[30.0, 0.0]]
     
     # Create and run node
     robot_driver = RobotDriver(pos)
-    rclpy.spin(robot_driver)
     
-    # Cleanup
-    robot_driver.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(robot_driver)
+    except KeyboardInterrupt:
+        robot_driver.save_trajectory_data()
+        # Cleanup
+        robot_driver.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
